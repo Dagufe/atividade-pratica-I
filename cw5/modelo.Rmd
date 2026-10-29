@@ -52,11 +52,292 @@ knitr::opts_chunk$set(
   fig.pos = "H"
 )
 
-# Carregamento modular dos scripts desenvolvidos em scripts/
-source("scripts/01_data_loader.R")
-source("scripts/02_eda_tables.R")
-source("scripts/03_eda_plots.R")
-source("scripts/04_model_analysis.R")
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(broom)
+  library(knitr)
+  library(kableExtra)
+  library(ggplot2)
+  library(patchwork)
+})
+
+# Caso os scripts modulares estejam presentes localmente, carrega-os;
+# caso contrário, utiliza as definições integradas para compilação autônoma.
+if (dir.exists("scripts") &&
+    file.exists("scripts/01_data_loader.R") &&
+    file.exists("scripts/02_eda_tables.R") &&
+    file.exists("scripts/03_eda_plots.R") &&
+    file.exists("scripts/04_model_analysis.R")) {
+  source("scripts/01_data_loader.R")
+  source("scripts/02_eda_tables.R")
+  source("scripts/03_eda_plots.R")
+  source("scripts/04_model_analysis.R")
+} else {
+  load_beta_data <- function(file_path = "Beta.xlsx") {
+    df <- readxl::read_excel(file_path, sheet = "Data")
+    required_cols <- c(
+      "Month", "Microsoft", "Exxon Mobil", "Caterpillar", 
+      "Johnson & Johnson", "McDonald's", "Sandisk", 
+      "Qualcomm", "Procter & Gamble", "S&P 500"
+    )
+    asset_cols <- setdiff(required_cols, "Month")
+    df %>%
+      dplyr::select(dplyr::all_of(required_cols)) %>%
+      dplyr::mutate(
+        Month = as.Date(Month),
+        dplyr::across(dplyr::all_of(asset_cols), ~ as.numeric(.x) * 100)
+      )
+  }
+
+  compute_descriptive_stats <- function(data, vars = c(
+    "Sandisk", "Qualcomm", "Caterpillar", "McDonald's",
+    "Exxon Mobil", "Microsoft", "Procter & Gamble", "Johnson & Johnson", "S&P 500"
+  )) {
+    results <- lapply(vars, function(var_name) {
+      x <- data[[var_name]][!is.na(data[[var_name]])]
+      q <- stats::quantile(x, probs = c(0.25, 0.5, 0.75))
+      m <- mean(x)
+      s <- sd(x)
+      data.frame(
+        Ativo = var_name, Minimo = min(x), Q1 = unname(q[1]),
+        Mediana = unname(q[2]), Media = m, Q3 = unname(q[3]),
+        Maximo = max(x), Desvio_Padrao = s, CV_Perc = (s / abs(m)) * 100,
+        stringsAsFactors = FALSE
+      )
+    })
+    do.call(rbind, results)
+  }
+
+  format_descriptive_table <- function(desc_df, caption = "Medidas descritivas dos retornos totais mensais em percentual (\\%) para as oito ações e o índice S\\&P 500 ($n = 36$ meses)") {
+    display_df <- desc_df %>%
+      dplyr::rename(
+        `Ativo / Índice` = Ativo, `Mínimo` = Minimo, `1º Quartil` = Q1,
+        `Mediana` = Mediana, `Média` = Media, `3º Quartil` = Q3,
+        `Máximo` = Maximo, `Desvio Padrão` = Desvio_Padrao, `CV (%)` = CV_Perc
+      )
+    knitr::kable(display_df, format = "latex", booktabs = TRUE, row.names = FALSE,
+                 digits = 2, caption = caption, align = c("l", rep("r", ncol(display_df) - 1))) %>%
+      kableExtra::kable_styling(latex_options = c("striped", "hold_position"), font_size = 9)
+  }
+
+  identify_outliers <- function(data, vars = c(
+    "Sandisk", "Qualcomm", "Caterpillar", "McDonald's",
+    "Exxon Mobil", "Microsoft", "Procter & Gamble", "Johnson & Johnson", "S&P 500"
+  )) {
+    outliers_list <- list()
+    for (v in vars) {
+      x <- data[[v]]
+      q1 <- stats::quantile(x, 0.25, na.rm = TRUE)
+      q3 <- stats::quantile(x, 0.75, na.rm = TRUE)
+      iqr <- q3 - q1
+      lower_bound <- q1 - 1.5 * iqr
+      upper_bound <- q3 + 1.5 * iqr
+      idx <- which(x < lower_bound | x > upper_bound)
+      if (length(idx) > 0) {
+        for (i in idx) {
+          tipo <- ifelse(x[i] < lower_bound, "Inferior", "Superior")
+          limite <- ifelse(tipo == "Inferior", lower_bound, upper_bound)
+          outliers_list[[length(outliers_list) + 1]] <- data.frame(
+            Ativo = v, Mes = format(data$Month[i], "%m/%Y"), Valor = x[i],
+            Tipo = tipo, Limite_IQR = unname(limite), stringsAsFactors = FALSE
+          )
+        }
+      }
+    }
+    do.call(rbind, outliers_list)
+  }
+
+  format_outliers_table <- function(df_outliers, caption = "Retornos mensais atípicos identificados pelo critério de $1{,}5 \\times \\text{IQR}$") {
+    display_df <- df_outliers %>%
+      dplyr::rename(
+        `Ativo / Índice` = Ativo, `Mês/Ano` = Mes, `Retorno Observado (%)` = Valor,
+        `Tipo de Outlier` = Tipo, `Barreira IQR (%)` = Limite_IQR
+      )
+    knitr::kable(display_df, format = "latex", booktabs = TRUE, row.names = FALSE,
+                 digits = 2, caption = caption, align = c("l", "c", "r", "c", "r")) %>%
+      kableExtra::kable_styling(latex_options = c("striped", "hold_position"), font_size = 9)
+  }
+
+  theme_academic <- function(base_size = 9) {
+    ggplot2::theme_minimal(base_size = base_size) +
+      ggplot2::theme(
+        plot.title = ggplot2::element_text(face = "bold", size = base_size + 1, hjust = 0.5),
+        plot.subtitle = ggplot2::element_text(size = base_size - 1, hjust = 0.5, color = "gray30"),
+        axis.title = ggplot2::element_text(face = "bold", size = base_size),
+        axis.text = ggplot2::element_text(size = base_size - 1, color = "black"),
+        panel.grid.minor = ggplot2::element_blank(),
+        panel.border = ggplot2::element_rect(color = "gray80", fill = NA, linewidth = 0.5),
+        strip.background = ggplot2::element_rect(fill = "gray95", color = "gray80"),
+        strip.text = ggplot2::element_text(face = "bold", size = base_size - 1)
+      )
+  }
+
+  plot_histograms <- function(data, vars = c(
+    "Sandisk", "Qualcomm", "Caterpillar", "McDonald's",
+    "Exxon Mobil", "Microsoft", "Procter & Gamble", "Johnson & Johnson", "S&P 500"
+  )) {
+    df_long <- data %>%
+      dplyr::select(dplyr::all_of(vars)) %>%
+      tidyr::pivot_longer(cols = dplyr::everything(), names_to = "Ativo", values_to = "Retorno") %>%
+      dplyr::mutate(Ativo = factor(Ativo, levels = vars))
+    ggplot2::ggplot(df_long, ggplot2::aes(x = Retorno)) +
+      ggplot2::geom_histogram(ggplot2::aes(y = ggplot2::after_stat(density)),
+                              bins = 10, fill = "#2C3E50", color = "white", alpha = 0.78) +
+      ggplot2::geom_density(color = "#E74C3C", linewidth = 0.8) +
+      ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "gray40", linewidth = 0.5) +
+      ggplot2::facet_wrap(~ Ativo, scales = "free", ncol = 3) +
+      ggplot2::labs(x = "Retorno Total Mensal (%)", y = "Densidade") +
+      theme_academic(base_size = 9)
+  }
+
+  plot_boxplots <- function(data, vars = c(
+    "S&P 500", "Johnson & Johnson", "Procter & Gamble", "Microsoft",
+    "Exxon Mobil", "McDonald's", "Caterpillar", "Qualcomm", "Sandisk"
+  )) {
+    df_long <- data %>%
+      dplyr::select(dplyr::all_of(vars)) %>%
+      tidyr::pivot_longer(cols = dplyr::everything(), names_to = "Ativo", values_to = "Retorno") %>%
+      dplyr::mutate(
+        Ativo = factor(Ativo, levels = vars),
+        Tipo = ifelse(Ativo == "S&P 500", "Índice de Mercado", "Ação Individual")
+      )
+    ggplot2::ggplot(df_long, ggplot2::aes(x = Ativo, y = Retorno, fill = Tipo)) +
+      ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+      ggplot2::geom_boxplot(outlier.color = "#E74C3C", outlier.size = 1.8, alpha = 0.8) +
+      ggplot2::scale_fill_manual(values = c("Índice de Mercado" = "#E67E22", "Ação Individual" = "#2980B9")) +
+      ggplot2::coord_flip() +
+      ggplot2::labs(x = "Ativo / Índice", y = "Retorno Total Mensal (%)", fill = "Categoria") +
+      theme_academic(base_size = 9) +
+      ggplot2::theme(legend.position = "top")
+  }
+
+  plot_bivariate_relationships <- function(data, stocks = c(
+    "Sandisk", "McDonald's", "Caterpillar", "Qualcomm",
+    "Exxon Mobil", "Procter & Gamble", "Microsoft", "Johnson & Johnson"
+  ), market = "S&P 500") {
+    df_long <- data %>%
+      dplyr::select(dplyr::all_of(c(market, stocks))) %>%
+      tidyr::pivot_longer(cols = dplyr::all_of(stocks), names_to = "Acao", values_to = "Retorno_Acao") %>%
+      dplyr::mutate(Acao = factor(Acao, levels = stocks))
+    ggplot2::ggplot(df_long, ggplot2::aes(x = .data[[market]], y = Retorno_Acao)) +
+      ggplot2::geom_hline(yintercept = 0, linetype = "dotted", color = "gray60") +
+      ggplot2::geom_vline(xintercept = 0, linetype = "dotted", color = "gray60") +
+      ggplot2::geom_point(color = "#34495E", alpha = 0.7, size = 1.6) +
+      ggplot2::geom_smooth(method = "lm", formula = y ~ x, color = "#2980B9", fill = "#BDC3C7", linewidth = 0.8) +
+      ggplot2::facet_wrap(~ Acao, scales = "free_y", ncol = 4) +
+      ggplot2::labs(x = "Retorno Total Mensal do Mercado - S&P 500 (%)", y = "Retorno Total Mensal da Ação (%)") +
+      theme_academic(base_size = 9)
+  }
+
+  fit_beta_models <- function(data, stocks = c(
+    "Sandisk", "McDonald's", "Caterpillar", "Qualcomm",
+    "Exxon Mobil", "Procter & Gamble", "Microsoft", "Johnson & Johnson"
+  )) {
+    models_list <- list()
+    summary_rows <- list()
+    for (s in stocks) {
+      form <- stats::as.formula(paste0("`", s, "` ~ `S&P 500`"))
+      m <- stats::lm(form, data = data)
+      models_list[[s]] <- m
+      sm <- summary(m)
+      cf <- stats::coef(sm)
+      ci <- stats::confint(m, level = 0.95)
+      f_stat <- sm$fstatistic
+      f_pval <- stats::pf(f_stat[1], f_stat[2], f_stat[3], lower.tail = FALSE)
+      summary_rows[[s]] <- data.frame(
+        Acao = s, b0 = cf[1, 1], se_b0 = cf[1, 2], t_b0 = cf[1, 3], p_b0 = cf[1, 4],
+        Beta = cf[2, 1], se_Beta = cf[2, 2], t_Beta = cf[2, 3], p_Beta = cf[2, 4],
+        CI_low = ci[2, 1], CI_high = ci[2, 2], r = stats::cor(data[[s]], data[["S&P 500"]]),
+        R2 = sm$r.squared, R2_adj = sm$adj.r.squared, R2_perc = sm$r.squared * 100,
+        Nao_Explicado_perc = (1 - sm$r.squared) * 100, sigma = sm$sigma,
+        F_stat = unname(f_stat[1]), p_F = unname(f_pval), stringsAsFactors = FALSE
+      )
+    }
+    summary_df <- do.call(rbind, summary_rows) %>% dplyr::arrange(dplyr::desc(Beta))
+    rownames(summary_df) <- NULL
+    list(models = models_list, summary = summary_df)
+  }
+
+  format_beta_estimates_table <- function(summary_df, caption = "Estimativas dos parâmetros dos modelos de regressão linear simples ($\\widehat{R}_j = b_0 + b_1 R_{\\text{S\\&P 500}}$) ordenadas pelo coeficiente Beta ($b_1$)") {
+    display_df <- summary_df %>%
+      dplyr::mutate(
+        Acao_tex = gsub("&", "\\\\&", Acao),
+        b0_str = sprintf("%.3f (%.3f)", b0, se_b0),
+        p_Beta_str = ifelse(p_Beta < 0.001, "< 0,001***",
+                            ifelse(p_Beta < 0.01, sprintf("%.4f**", p_Beta),
+                                   ifelse(p_Beta < 0.05, sprintf("%.4f*", p_Beta),
+                                          sprintf("%.4f (ns)", p_Beta)))),
+        IC_95 = sprintf("[%.3f; %.3f]", CI_low, CI_high),
+        Perfil = ifelse(Beta > 1, "Agressiva ($\\beta > 1$)", "Defensiva ($\\beta < 1$)")
+      ) %>%
+      dplyr::select(
+        `Ação` = Acao_tex, `$b_0$ (EP)` = b0_str, `Beta ($b_1$)` = Beta,
+        `EP ($b_1$)` = se_Beta, `Estatística $t$` = t_Beta,
+        `$p$-valor ($b_1$)` = p_Beta_str, `IC 95\\% ($b_1$)` = IC_95, `Classificação` = Perfil
+      )
+    knitr::kable(display_df, format = "latex", booktabs = TRUE, row.names = FALSE,
+                 escape = FALSE, digits = 3, caption = caption,
+                 align = c("l", "c", "r", "r", "r", "c", "c", "l")) %>%
+      kableExtra::kable_styling(latex_options = c("striped", "hold_position", "scale_down"), font_size = 9)
+  }
+
+  format_goodness_of_fit_table <- function(summary_df, caption = "Qualidade do ajuste e proporção da variabilidade do retorno explicada pelo mercado ($R^2$) vs. risco idiossincrático ($1 - R^2$)") {
+    display_df <- summary_df %>%
+      dplyr::arrange(dplyr::desc(R2)) %>%
+      dplyr::mutate(
+        Acao_tex = gsub("&", "\\\\&", Acao),
+        R2_str = sprintf("%.2f\\%%", R2_perc),
+        Idio_str = sprintf("%.2f\\%%", Nao_Explicado_perc)
+      ) %>%
+      dplyr::select(
+        `Ação` = Acao_tex, `$r$ de Pearson` = r, `$R^2$` = R2, `$R^2$ Ajustado` = R2_adj,
+        `Explicado pelo Mercado ($R^2$)` = R2_str, `Risco Específico ($1 - R^2$)` = Idio_str,
+        `$\\hat{\\sigma}_{\\text{res}}$ (\\%)` = sigma, `Estatística $F$` = F_stat
+      )
+    knitr::kable(display_df, format = "latex", booktabs = TRUE, row.names = FALSE,
+                 escape = FALSE, digits = 3, caption = caption,
+                 align = c("l", "r", "r", "r", "r", "r", "r", "r")) %>%
+      kableExtra::kable_styling(latex_options = c("striped", "hold_position", "scale_down"), font_size = 9)
+  }
+
+  plot_beta_and_r2 <- function(summary_df) {
+    df_plot <- summary_df %>%
+      dplyr::mutate(
+        Acao_ord_beta = factor(Acao, levels = rev(Acao)),
+        Significativo = ifelse(p_Beta < 0.05, "Significativo (p < 0,05)", "Não significativo (p >= 0,05)")
+      )
+    p1 <- ggplot2::ggplot(df_plot, ggplot2::aes(x = Beta, y = Acao_ord_beta, color = Significativo)) +
+      ggplot2::geom_vline(xintercept = 1, linetype = "dashed", color = "#E74C3C", linewidth = 0.7) +
+      ggplot2::geom_vline(xintercept = 0, linetype = "dotted", color = "gray50", linewidth = 0.6) +
+      ggplot2::geom_errorbarh(ggplot2::aes(xmin = CI_low, xmax = CI_high), height = 0.25, linewidth = 0.7) +
+      ggplot2::geom_point(size = 2.6) +
+      ggplot2::geom_text(ggplot2::aes(label = sprintf("%.2f", Beta)), vjust = -0.75, size = 2.6, show.legend = FALSE) +
+      ggplot2::scale_y_discrete(expand = ggplot2::expansion(mult = c(0.08, 0.16))) +
+      ggplot2::scale_color_manual(values = c("Significativo (p < 0,05)" = "#2980B9", "Não significativo (p >= 0,05)" = "#7F8C8D")) +
+      ggplot2::labs(title = "(a) Coeficiente Beta e IC 95%", subtitle = "Linha tracejada: Beta do mercado = 1,0",
+                    x = "Estimativa de Beta (b1)", y = "Ação", color = "") +
+      ggplot2::theme_minimal(base_size = 8.5) +
+      ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", hjust = 0.5, size = 9),
+                     plot.subtitle = ggplot2::element_text(hjust = 0.5, size = 7.5, color = "gray30"),
+                     legend.position = "bottom")
+    df_r2 <- summary_df %>%
+      dplyr::arrange(R2_perc) %>%
+      dplyr::mutate(Acao_ord_r2 = factor(Acao, levels = Acao))
+    p2 <- ggplot2::ggplot(df_r2, ggplot2::aes(x = R2_perc, y = Acao_ord_r2)) +
+      ggplot2::geom_col(fill = "#2C3E50", alpha = 0.85, width = 0.62) +
+      ggplot2::geom_text(ggplot2::aes(label = sprintf("%.1f%%", R2_perc)), hjust = -0.15, size = 2.6, color = "black") +
+      ggplot2::scale_x_continuous(limits = c(0, 42)) +
+      ggplot2::scale_y_discrete(expand = ggplot2::expansion(mult = c(0.08, 0.12))) +
+      ggplot2::labs(title = "(b) Variância Explicada (R²)", subtitle = "Percentual explicado pelo índice S&P 500",
+                    x = "Coeficiente de Determinação R² (%)", y = "") +
+      ggplot2::theme_minimal(base_size = 8.5) +
+      ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", hjust = 0.5, size = 9),
+                     plot.subtitle = ggplot2::element_text(hjust = 0.5, size = 7.5, color = "gray30"))
+    p1 | p2
+  }
+}
 
 # Carregamento e preparação dos dados (retornos mensais em percentual %)
 dados_beta <- load_beta_data("Beta.xlsx")
